@@ -13,11 +13,11 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "1.0.0" }
 
-defmt = "1"
-defmt-rtt = "1"
-panic-probe = { version = "1", features = ["print-defmt"] }
+panic-halt = "0.2"
 
 rp-pico = "0.9"
+
+heapless = "0.8"
 
 usb-device = { version = "0.3", optional = true }
 usbd-serial = { version = "0.2", optional = true }

@@ -1,189 +1,235 @@
 //! Hardware clock control for Spock's brain
+//!
+//! PAC-level XOSC + PLL + clock mux setup. Used from [`crate::main`]. Every wait
+//! loop is bounded so a bad crystal or mux never **silently** freezes the CPU
+//! (which looks like “boot pulse then LED dead”).
+
+use core::fmt;
 
 use rp_pico::hal::pac::Peripherals;
 
 ////////////////////////////////////////////////////////////////////////////////
-/// CONSTANTS
+// ERRORS
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Magic value for XOSC CTRL ENABLE field (bits 23:12). Writing this enables
-/// the crystal oscillator.
-const XOSC_CTRL_ENABLE_MAGIC: u32 = 0xfab;
+/// Failure while bringing up XOSC / PLLs / glitchless muxes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClockInitError {
+    /// XOSC `STABLE` never set (bad crystal, solder, or wrong board).
+    XoscNotStable,
+    /// `CLK_REF_SELECTED` never showed XOSC (glitchless mux stuck).
+    ClkRefNotXosc,
+    /// `PLL_SYS` never reported lock.
+    PllSysNotLocked,
+    /// `PLL_USB` never reported lock.
+    PllUsbNotLocked,
+    /// `CLK_SYS_SELECTED` never showed aux / PLL path.
+    ClkSysNotAux,
+}
 
-/// Offset for XOSC CTRL ENABLE field (bits 23:12)
-const XOSC_CTRL_ENABLE_OFFSET: u32 = 12;
-
-/// XOSC CTRL FREQ_RANGE for 1–15 MHz crystal (bits 11:0 = 0xAA0 per datasheet).
-const XOSC_CTRL_FREQ_RANGE_1_15MHZ: u32 = 0xAA0;
-
-/// For 12 MHz XOSC, delay value (bits 13:0) for 1 ms startup.
-/// One unit = 256 * xtal_period ⇒ 1 ms = 0.001 * 12e6 / 256 ≈ 46.875 → 47.
-const XOSC_STARTUP_DELAY_1MS_12MHZ: u16 = 47;
-
-/// XOSC STATUS register bit for stable oscillator
-const XOSC_STATUS_STABLE: u32 = 1 << 31;
+impl fmt::Debug for ClockInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::XoscNotStable => write!(f, "XoscNotStable"),
+            Self::ClkRefNotXosc => write!(f, "ClkRefNotXosc"),
+            Self::PllSysNotLocked => write!(f, "PllSysNotLocked"),
+            Self::PllUsbNotLocked => write!(f, "PllUsbNotLocked"),
+            Self::ClkSysNotAux => write!(f, "ClkSysNotAux"),
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
-/// CLOCK INITIALIZATION HELPERS
+// CONSTANTS
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Initialize the external 12 MHz crystal oscillator by directly writing the 
-/// ENABLE field of the XOSC CTRL register. Bits 23:12 must be 0xfab to enable.
-/// STARTUP delay is set for 1 ms before the oscillator is enabled.
-fn init_xosc_12mhz(pac: &mut Peripherals) {
-    pac.XOSC
-        .startup()
-        .write(|w| unsafe { w.delay().bits(XOSC_STARTUP_DELAY_1MS_12MHZ) });
+/// `CLK_REF_CTRL.SRC` index for XOSC (`SRC_A::XOSC_CLKSRC = 2`).
+const CLK_REF_SEL_XOSC: u32 = 1 << 2;
 
-    // Enable XOSC and set FREQ_RANGE for 1–15 MHz (required for 12 MHz crystal).
-    pac.XOSC.ctrl().write(|w| unsafe {
-        w.bits((XOSC_CTRL_ENABLE_MAGIC << XOSC_CTRL_ENABLE_OFFSET)
-            | XOSC_CTRL_FREQ_RANGE_1_15MHZ)
+/// `CLK_SYS_CTRL.SRC` index for the aux mux (`CLKSRC_CLK_SYS_AUX = 1`).
+const CLK_SYS_SEL_AUX: u32 = 1 << 1;
+
+/// Max inner-loop iterations for each hardware wait (enough at ROSC post-reset).
+const SPIN_XOSC_STABLE: u32 = 5_000_000;
+const SPIN_CLK_SELECTED: u32 = 5_000_000;
+const SPIN_PLL_LOCK: u32 = 5_000_000;
+
+////////////////////////////////////////////////////////////////////////////////
+// SPIN HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+#[inline]
+fn spin_until(
+    mut done: impl FnMut() -> bool,
+    max_iters: u32,
+    err: ClockInitError,
+) -> Result<(), ClockInitError> {
+    for _ in 0..max_iters {
+        if done() {
+            return Ok(());
+        }
+        cortex_m::asm::nop();
+    }
+    Err(err)
+}
+
+fn wait_clk_ref_xosc_selected(pac: &Peripherals) -> Result<(), ClockInitError> {
+    spin_until(
+        || pac.CLOCKS.clk_ref_selected().read().bits() == CLK_REF_SEL_XOSC,
+        SPIN_CLK_SELECTED,
+        ClockInitError::ClkRefNotXosc,
+    )
+}
+
+fn wait_clk_sys_aux_selected(pac: &Peripherals) -> Result<(), ClockInitError> {
+    spin_until(
+        || pac.CLOCKS.clk_sys_selected().read().bits() == CLK_SYS_SEL_AUX,
+        SPIN_CLK_SELECTED,
+        ClockInitError::ClkSysNotAux,
+    )
+}
+
+/// Bring up the 12 MHz crystal. Sequence matches `rp2040_hal::xosc` (freq_range →
+/// startup → enable); a single raw `ctrl` write or a too-short startup delay can
+/// leave STABLE never set, hanging `init` forever.
+fn init_xosc_12mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
+    const CRYSTAL_HZ: u32 = 12_000_000;
+    const STARTUP_MULT: u32 = 64;
+
+    pac.XOSC.ctrl().write(|w| {
+        w.freq_range()._1_15mhz();
+        w
     });
 
-    // Wait until STATUS indicates oscillator is running and stable (bit 31
-    // STABLE).
-    while pac.XOSC.status().read().bits() & XOSC_STATUS_STABLE == 0 {}
+    let startup_delay = (CRYSTAL_HZ / (1000 * 256)) * STARTUP_MULT;
+    let startup_delay: u16 = startup_delay.min(u32::from(u16::MAX)) as u16;
+
+    pac.XOSC
+        .startup()
+        .write(|w| unsafe { w.delay().bits(startup_delay) });
+
+    pac.XOSC.ctrl().write(|w| {
+        w.freq_range()._1_15mhz();
+        w.enable().enable();
+        w
+    });
+
+    spin_until(
+        || pac.XOSC.status().read().stable().bit_is_set(),
+        SPIN_XOSC_STABLE,
+        ClockInitError::XoscNotStable,
+    )
 }
 
 /// Initialize the system clock PLL to 125 MHz
-fn init_pll_sys_125mhz(pac: &mut Peripherals) {
-    // To drive the system clock at 125 MHz, we set the following parameters:
-    // - refdiv   = 1   -- input clock is 12 MHz
-    // - fbdiv    = 125 -- FREF * FBDIV = 12 MHz * 125 = 1500 MHz
-    // - postdiv1 = 6   -- 1500 MHz / 6 = 250 MHz
-    // - postdiv2 = 2   -- 250 MHz / 2  = 125 MHz
-
-    // Turn off main PLL power, VCO power, and post-divider power
+fn init_pll_sys_125mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
     pac.PLL_SYS
         .pwr()
         .write(|w| w.pd().set_bit().vcopd().set_bit().postdivpd().set_bit());
 
-    // Program reference clock divider (bits 5:0 of CS register) to 1
     pac.PLL_SYS.cs().write(|w| unsafe { w.refdiv().bits(1) });
-
-    // Program feedback divider (bits 11:0 of FBDIV_INT register) to 125
     pac.PLL_SYS.fbdiv_int().write(|w| unsafe { w.bits(125) });
 
-    // Turn ON PLL main power and VCO power; keep post-divider off until PRIM is
-    // programmed.
     pac.PLL_SYS
         .pwr()
         .write(|w|
             w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
 
-    // Wait for PLL to lock (bit 31 of CS register)
-    while pac.PLL_SYS.cs().read().bits() & (1 << 31) == 0 {}
+    spin_until(
+        || pac.PLL_SYS.cs().read().lock().bit_is_set(),
+        SPIN_PLL_LOCK,
+        ClockInitError::PllSysNotLocked,
+    )?;
 
-    // Program the 2 post-dividers (must be done while post-divider is powered
-    // down).
     pac.PLL_SYS
         .prim()
         .write(|w| unsafe { w.postdiv1().bits(6).postdiv2().bits(2) });
 
-    // Turn ON power to the post-dividers
     pac.PLL_SYS
         .pwr()
         .write(|w|
             w.pd().clear_bit().vcopd().clear_bit().postdivpd().clear_bit());
+
+    Ok(())
 }
 
 /// Initialize the usb clock PLL to 48 MHz
-fn init_pll_usb_48mhz(pac: &mut Peripherals) {
-    // To drive the usb clock at 48 MHz, we set the following parameters:
-    // - refdiv   = 1   -- input clock is 12 MHz
-    // - fbdiv    = 40  -- FREF * FBDIV = 12 MHz * 40 = 480 MHz
-    // - postdiv1 = 5   -- 480 MHz / 5 = 96 MHz
-    // - postdiv2 = 2   -- 96 MHz / 2 = 48 MHz
-
-    // Turn off main PLL power, VCO power, and post-divider power (one write so
-    // all bits stick).
+fn init_pll_usb_48mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
     pac.PLL_USB
         .pwr()
         .write(|w| w.pd().set_bit().vcopd().set_bit().postdivpd().set_bit());
 
-    // Program reference clock divider (bits 5:0 of CS register) to 1
     pac.PLL_USB.cs().write(|w| unsafe { w.refdiv().bits(1) });
-
-    // Program feedback divider (bits 11:0 of FBDIV_INT register) to 40
     pac.PLL_USB.fbdiv_int().write(|w| unsafe { w.bits(40) });
 
-    // Turn ON PLL main power and VCO power; keep post-divider off until PRIM is
-    // programmed.
     pac.PLL_USB
         .pwr()
         .write(|w|
             w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
 
-    // Wait for PLL to lock (bit 31 of CS register)
-    while pac.PLL_USB.cs().read().bits() & (1 << 31) == 0 {}
+    spin_until(
+        || pac.PLL_USB.cs().read().lock().bit_is_set(),
+        SPIN_PLL_LOCK,
+        ClockInitError::PllUsbNotLocked,
+    )?;
 
-    // Program the 2 post-dividers (must be done while post-divider is powered
-    // down).
     pac.PLL_USB
         .prim()
         .write(|w| unsafe { w.postdiv1().bits(5).postdiv2().bits(2) });
 
-    // Turn ON power to the post-dividers
     pac.PLL_USB
         .pwr()
         .write(|w|
             w.pd().clear_bit().vcopd().clear_bit().postdivpd().clear_bit());
+
+    Ok(())
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////
-/// PUB CLOCK INITIALIZATION ROUTINES
+// PUB CLOCK INITIALIZATION ROUTINES
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Initialize PLLS for the external 12 MHz oscillator
-pub fn init_12mhz_xosc_plls(pac: &mut Peripherals) {
-    // Bring up the external 12 MHz oscillator
-    init_xosc_12mhz(pac);
+/// Initialize PLLs for the external 12 MHz oscillator. Returns [`Err`] if any
+/// hardware wait times out instead of blocking forever.
+pub fn init_12mhz_xosc_plls(pac: &mut Peripherals) -> Result<(), ClockInitError> {
+    init_xosc_12mhz(pac)?;
 
-    // CLK_REF_CTRL bits 1:0 = 0x2 select XOSC glitchlessly.
     pac.CLOCKS
         .clk_ref_ctrl()
         .modify(|_, w| w.src().xosc_clksrc());
 
-    // No divider needed for XOSC, so set CLK_REF_DIV to 1.
     pac.CLOCKS
         .clk_ref_div()
-        .write(|w| unsafe { w.bits(1) });
+        .write(|w| unsafe { w.bits(0x0100) });
 
-    // Lock the sys reference PLL to 125 MHz
-    init_pll_sys_125mhz(pac);
+    wait_clk_ref_xosc_selected(pac)?;
 
-    // Lock the usb reference PLL to 48 MHz
-    init_pll_usb_48mhz(pac);
+    init_pll_sys_125mhz(pac)?;
+    init_pll_usb_48mhz(pac)?;
 
-    // Set the system clock to the PLL_SYS output. SRC selects ref vs aux;
-    // AUXSRC selects which aux source (PLL_SYS). Glitchless mux uses aux when
-    // SRC=1.
     pac.CLOCKS
         .clk_sys_ctrl()
         .modify(|_, w| w.auxsrc().clksrc_pll_sys().src().clksrc_clk_sys_aux());
 
-    // Ensure system clock divider is 1
     pac.CLOCKS
         .clk_sys_div()
-        .write(|w| unsafe { w.bits(1) });
+        .write(|w| unsafe { w.bits(0x0100) });
 
-    // Set the usb clock to the PLL_USB output (CLK_USB has only AUXSRC, no
-    // SRC).
-    pac.CLOCKS
-        .clk_usb_ctrl()
-        .modify(|_, w| w.auxsrc().clksrc_pll_usb());
+    wait_clk_sys_aux_selected(pac)?;
 
-    // Ensure usb clock divider is 1
+    pac.CLOCKS.clk_usb_ctrl().modify(|_, w| {
+        w.auxsrc().clksrc_pll_usb();
+        w.enable().set_bit()
+    });
+
     pac.CLOCKS
         .clk_usb_div()
-        .write(|w| unsafe { w.bits(1) });
+        .write(|w| unsafe { w.bits(0x0100) });
 
-    // Set peripheral clock to follow clk_sys (125 MHz). Typical RP2040
-    // reference design uses clk_peri = clk_sys so peripherals run at system
-    // clock.
-    pac.CLOCKS
-        .clk_peri_ctrl()
-        .modify(|_, w| w.auxsrc().clk_sys());
+    pac.CLOCKS.clk_peri_ctrl().modify(|_, w| {
+        w.auxsrc().clk_sys();
+        w.enable().set_bit()
+    });
+
+    Ok(())
 }

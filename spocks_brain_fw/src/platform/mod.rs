@@ -7,23 +7,23 @@ pub mod clocks;
 pub mod constants;
 pub mod gpio;
 pub mod resets;
+pub mod timers;
 pub mod uart;
 
-use rp_pico::hal::pac::Peripherals;
+use rp_pico::hal::pac::{IO_BANK0, PADS_BANK0, SIO, UART0};
 
-/// Initialize the hardware. We use the available register map since recreating
-/// it offers little learning other than how to read a datasheet.
-pub fn init(pac: &mut Peripherals) {
-    // Release resets for the blocks needed during init
-    resets::clear_pll_resets(pac);
-    resets::clear_io_resets(pac);
-    
-    // Bringup the system clock and peripheral clocks
-    clocks::init_12mhz_xosc_plls(pac);
-
-    // GP0 = UART0 TX, GP1 = UART0 RX for GNSS
-    gpio::init_gpios(pac);
-
-    // Initialize UART0 for GNSS
-    uart::init_uart0(pac, constants::UART0_BAUD_RATE);
+/// GPIO + UART after the system clock runs at 125 MHz. Clock bring-up is done
+/// in [`crate::main`] via [`clocks::init_12mhz_xosc_plls`].
+///
+/// Takes register blocks individually so this still compiles after `pac` is
+/// partially moved by [`rp2040_hal::clocks::init_clocks_and_plls`].
+pub fn init(
+    io: &mut IO_BANK0,
+    pads: &mut PADS_BANK0,
+    sio: &mut SIO,
+    uart0: &mut UART0,
+) {
+    gpio::init_gpios(io, pads);
+    gpio::init_onboard_led(io, pads, sio);
+    uart::init_uart0(uart0, constants::UART0_BAUD_RATE);
 }

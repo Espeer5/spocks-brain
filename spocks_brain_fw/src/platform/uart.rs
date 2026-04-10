@@ -1,10 +1,10 @@
 //! UART control for Spock's brain
 
 use crate::platform::constants::PERI_CLOCK_HZ;
-use rp_pico::hal::pac::Peripherals;
+use rp_pico::hal::pac::UART0;
 
 ////////////////////////////////////////////////////////////////////////////////
-/// UART INITIALIZATION HELPERS
+// UART INITIALIZATION HELPERS
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Calculate the baud divisors for the given baud rate
@@ -19,19 +19,17 @@ fn baud_divisors(baud_rate: u32) -> (u16, u8) {
     let remainder    = PERI_CLOCK_HZ % divisor;
 
     // frac64 = round(rem * 64 / divisor)
-    let frac64 = (remainder as u32 * 64 + divisor / 2) / divisor as u32;
+    let frac64 = (remainder * 64 + divisor / 2) / divisor;
 
     (integer_part, frac64 as u8)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-/// PUB UART INITIALIZATION ROUTINES
+// PUB UART INITIALIZATION ROUTINES
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Initialize UART0 for use with the GNSS module
-pub fn init_uart0(pac: &mut Peripherals, baud_rate: u32) {
-    // Set up the UART0 peripheral
-    let uart0 = &pac.UART0;
+pub fn init_uart0(uart0: &mut UART0, baud_rate: u32) {
 
     // Disable UART while configuring
     uart0.uartcr().modify(|_, w| w.uarten().clear_bit());
