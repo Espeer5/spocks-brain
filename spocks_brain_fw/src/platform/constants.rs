@@ -1,0 +1,25 @@
+//! Platform constants for Spock's brain
+
+////////////////////////////////////////////////////////////////////////////////
+/// CLOCK FREQUENCIES
+////////////////////////////////////////////////////////////////////////////////
+
+/// System clock frequency in Hz
+#[allow(dead_code)]
+pub const SYS_CLOCK_HZ: u32 = 125_000_000;
+
+/// USB clock frequency in Hz
+#[allow(dead_code)]
+pub const USB_CLOCK_HZ: u32 = 48_000_000;
+
+/// Peripheral clock frequency in Hz
+#[allow(dead_code)]
+pub const PERI_CLOCK_HZ: u32 = SYS_CLOCK_HZ;
+
+////////////////////////////////////////////////////////////////////////////////
+/// PERIPHERAL BAUD RATES
+////////////////////////////////////////////////////////////////////////////////
+
+/// UART0 baud rate for GNSS module
+#[allow(dead_code)]
+pub const UART0_BAUD_RATE: u32 = 9600;
