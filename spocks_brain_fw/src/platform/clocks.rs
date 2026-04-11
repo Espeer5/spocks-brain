@@ -1,8 +1,17 @@
 //! Hardware clock control for Spock's brain
 //!
-//! PAC-level XOSC + PLL + clock mux setup. Used from [`crate::main`]. Every wait
-//! loop is bounded so a bad crystal or mux never **silently** freezes the CPU
-//! (which looks like “boot pulse then LED dead”).
+//! PAC-level XOSC + PLL + clock mux setup used from [`crate::main`] via [`init_12mhz_xosc_plls`].
+//! Sequencing matches [`rp_pico::hal::clocks::init_clocks_and_plls`] where it matters: clear
+//! `CLK_SYS_RESUS_CTRL`, switch `CLK_SYS` to `CLK_REF` and wait before selecting `PLL_SYS` on the
+//! aux mux, then enable the watchdog 1 µs tick from `clk_ref` (12 MHz → 12 cycles).
+//! Every wait loop is bounded so a bad crystal or mux never **silently** freezes the CPU (which
+//! looks like “boot pulse then LED dead”).
+//!
+//! USB logging still uses the HAL’s [`UsbClock`](rp_pico::hal::clocks::UsbClock) type token for
+//! [`UsbBus`](rp_pico::hal::usb::UsbBus); after this module configures `CLK_USB` in hardware,
+//! [`crate::main`] wraps the `CLOCKS` block in [`ClocksManager::new`](rp_pico::hal::clocks::ClocksManager::new)
+//! and moves out that token only — clock programming stays here, not in
+//! [`init_clocks_and_plls`](rp_pico::hal::clocks::init_clocks_and_plls).
 
 use core::fmt;
 
@@ -23,6 +32,8 @@ pub enum ClockInitError {
     PllSysNotLocked,
     /// `PLL_USB` never reported lock.
     PllUsbNotLocked,
+    /// `CLK_SYS_SELECTED` never returned to CLK_REF before selecting the aux mux (glitchless mux).
+    ClkSysNotRef,
     /// `CLK_SYS_SELECTED` never showed aux / PLL path.
     ClkSysNotAux,
 }
@@ -34,6 +45,7 @@ impl fmt::Debug for ClockInitError {
             Self::ClkRefNotXosc => write!(f, "ClkRefNotXosc"),
             Self::PllSysNotLocked => write!(f, "PllSysNotLocked"),
             Self::PllUsbNotLocked => write!(f, "PllUsbNotLocked"),
+            Self::ClkSysNotRef => write!(f, "ClkSysNotRef"),
             Self::ClkSysNotAux => write!(f, "ClkSysNotAux"),
         }
     }
@@ -46,8 +58,11 @@ impl fmt::Debug for ClockInitError {
 /// `CLK_REF_CTRL.SRC` index for XOSC (`SRC_A::XOSC_CLKSRC = 2`).
 const CLK_REF_SEL_XOSC: u32 = 1 << 2;
 
-/// `CLK_SYS_CTRL.SRC` index for the aux mux (`CLKSRC_CLK_SYS_AUX = 1`).
-const CLK_SYS_SEL_AUX: u32 = 1 << 1;
+/// `CLK_SYS_SELECTED` one-hot when glitchless mux selects `CLK_REF` (see PAC reset value `0x01`).
+const CLK_SYS_SELECTED_REF: u32 = 1 << 0;
+
+/// `CLK_SYS_SELECTED` one-hot when the aux path (`CLKSRC_CLK_SYS_AUX`) is selected.
+const CLK_SYS_SELECTED_AUX: u32 = 1 << 1;
 
 /// Max inner-loop iterations for each hardware wait (enough at ROSC post-reset).
 const SPIN_XOSC_STABLE: u32 = 5_000_000;
@@ -81,12 +96,31 @@ fn wait_clk_ref_xosc_selected(pac: &Peripherals) -> Result<(), ClockInitError> {
     )
 }
 
+fn wait_clk_sys_ref_selected(pac: &Peripherals) -> Result<(), ClockInitError> {
+    spin_until(
+        || pac.CLOCKS.clk_sys_selected().read().bits() == CLK_SYS_SELECTED_REF,
+        SPIN_CLK_SELECTED,
+        ClockInitError::ClkSysNotRef,
+    )
+}
+
 fn wait_clk_sys_aux_selected(pac: &Peripherals) -> Result<(), ClockInitError> {
     spin_until(
-        || pac.CLOCKS.clk_sys_selected().read().bits() == CLK_SYS_SEL_AUX,
+        || pac.CLOCKS.clk_sys_selected().read().bits() == CLK_SYS_SELECTED_AUX,
         SPIN_CLK_SELECTED,
         ClockInitError::ClkSysNotAux,
     )
+}
+
+/// Match [`rp2040_hal::clocks::init_clocks_and_plls`]: `clk_tick` runs at 1 MHz from `clk_ref` (12 MHz → 12 cycles).
+fn enable_watchdog_us_tick_from_clk_ref_mhz(
+    watchdog: &mut rp_pico::hal::pac::WATCHDOG,
+    clk_ref_mhz: u8,
+) {
+    const WATCHDOG_TICK_ENABLE_BITS: u32 = 0x200;
+    watchdog
+        .tick()
+        .write(|w| unsafe { w.bits(WATCHDOG_TICK_ENABLE_BITS | u32::from(clk_ref_mhz)) });
 }
 
 /// Bring up the 12 MHz crystal. Sequence matches `rp2040_hal::xosc` (freq_range →
@@ -132,8 +166,7 @@ fn init_pll_sys_125mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
 
     pac.PLL_SYS
         .pwr()
-        .write(|w|
-            w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
+        .write(|w| w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
 
     spin_until(
         || pac.PLL_SYS.cs().read().lock().bit_is_set(),
@@ -145,10 +178,14 @@ fn init_pll_sys_125mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
         .prim()
         .write(|w| unsafe { w.postdiv1().bits(6).postdiv2().bits(2) });
 
-    pac.PLL_SYS
-        .pwr()
-        .write(|w|
-            w.pd().clear_bit().vcopd().clear_bit().postdivpd().clear_bit());
+    pac.PLL_SYS.pwr().write(|w| {
+        w.pd()
+            .clear_bit()
+            .vcopd()
+            .clear_bit()
+            .postdivpd()
+            .clear_bit()
+    });
 
     Ok(())
 }
@@ -164,8 +201,7 @@ fn init_pll_usb_48mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
 
     pac.PLL_USB
         .pwr()
-        .write(|w|
-            w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
+        .write(|w| w.pd().clear_bit().vcopd().clear_bit().postdivpd().set_bit());
 
     spin_until(
         || pac.PLL_USB.cs().read().lock().bit_is_set(),
@@ -177,10 +213,14 @@ fn init_pll_usb_48mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
         .prim()
         .write(|w| unsafe { w.postdiv1().bits(5).postdiv2().bits(2) });
 
-    pac.PLL_USB
-        .pwr()
-        .write(|w|
-            w.pd().clear_bit().vcopd().clear_bit().postdivpd().clear_bit());
+    pac.PLL_USB.pwr().write(|w| {
+        w.pd()
+            .clear_bit()
+            .vcopd()
+            .clear_bit()
+            .postdivpd()
+            .clear_bit()
+    });
 
     Ok(())
 }
@@ -192,6 +232,12 @@ fn init_pll_usb_48mhz(pac: &mut Peripherals) -> Result<(), ClockInitError> {
 /// Initialize PLLs for the external 12 MHz oscillator. Returns [`Err`] if any
 /// hardware wait times out instead of blocking forever.
 pub fn init_12mhz_xosc_plls(pac: &mut Peripherals) -> Result<(), ClockInitError> {
+    // `ClocksManager::new` clears this; stale resuscitation state can disturb clk_sys when load changes
+    // (e.g. USB attach after BOOTSEL) — see RP2040 `CLK_SYS_RESUS_*`, Pico SDK `runtime_init_clocks`.
+    unsafe {
+        pac.CLOCKS.clk_sys_resus_ctrl().write_with_zero(|w| w);
+    }
+
     init_xosc_12mhz(pac)?;
 
     pac.CLOCKS
@@ -206,6 +252,12 @@ pub fn init_12mhz_xosc_plls(pac: &mut Peripherals) -> Result<(), ClockInitError>
 
     init_pll_sys_125mhz(pac)?;
     init_pll_usb_48mhz(pac)?;
+
+    // Same order as HAL `SystemClock::configure_clock`: run the glitchless mux from CLK_REF, then
+    // point the aux mux at PLL_SYS, then select AUX — avoids marginal mux behavior when jumping
+    // straight from reset / an unknown prior state.
+    pac.CLOCKS.clk_sys_ctrl().modify(|_, w| w.src().clk_ref());
+    wait_clk_sys_ref_selected(pac)?;
 
     pac.CLOCKS
         .clk_sys_ctrl()
@@ -230,6 +282,9 @@ pub fn init_12mhz_xosc_plls(pac: &mut Peripherals) -> Result<(), ClockInitError>
         w.auxsrc().clk_sys();
         w.enable().set_bit()
     });
+
+    // Matches HAL `Watchdog::enable_tick_generation` after clocks — 1 µs ticks on `clk_tick` from clk_ref.
+    enable_watchdog_us_tick_from_clk_ref_mhz(&mut pac.WATCHDOG, 12);
 
     Ok(())
 }

@@ -175,6 +175,29 @@ pub fn init_timer_hardware(timer: &mut TIMER) {
     timer.inte().write(|w| unsafe { w.bits(0) });
 }
 
+/// Configure NVIC priorities so timer IRQs **preempt** UART0 RX.
+///
+/// On Cortex-M0+, interrupts at the same priority cannot preempt each other. A
+/// floating or noisy UART RX line can re-enter `UART0_IRQ` continuously; that
+/// delays [`TIMER_IRQ_0`] and makes periodic callbacks (e.g. LED blink) appear
+/// to run at a much slower rate than requested.
+///
+/// Call **before** [`enable_timer_interrupts`] or [`crate::platform::uart::enable_uart0_interrupt`].
+pub fn configure_irq_priorities() {
+    use rp_pico::hal::pac::Interrupt;
+
+    let mut cp = cortex_m::Peripherals::take().expect("cortex_m::Peripherals");
+
+    // 0 = highest priority on RP2040 (2-bit NVIC field → 4 levels).
+    unsafe {
+        cp.NVIC.set_priority(Interrupt::TIMER_IRQ_0, 0);
+        cp.NVIC.set_priority(Interrupt::TIMER_IRQ_1, 0);
+        cp.NVIC.set_priority(Interrupt::TIMER_IRQ_2, 0);
+        cp.NVIC.set_priority(Interrupt::TIMER_IRQ_3, 0);
+        cp.NVIC.set_priority(Interrupt::UART0_IRQ, 2);
+    }
+}
+
 /// Unmask `TIMER_IRQ_0` … `TIMER_IRQ_3` in the NVIC. Call after
 // [`init_timer_hardware`].
 pub fn enable_timer_interrupts() {
@@ -376,7 +399,7 @@ pub fn cancel_soft(timer: &mut TIMER, id: SoftTimerId) {
     });
 }
 
-/// `TIMER_IRQ_0` handler: drain due timers from the min-heap, re-arm **ALARM0** 
+/// `TIMER_IRQ_0` handler: drain due timers from the min-heap, re-arm **ALARM0**
 pub fn handle_alarm0_multiplex(timer: &mut TIMER) {
     clear_intr(timer, 0);
 

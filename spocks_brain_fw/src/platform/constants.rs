@@ -19,9 +19,18 @@ pub const PERI_CLOCK_HZ: u32 = SYS_CLOCK_HZ;
 // PERIPHERAL BAUD RATES
 ////////////////////////////////////////////////////////////////////////////////
 
-/// UART0 baud rate for GNSS module
-#[allow(dead_code)]
+/// UART0 baud rate for GNSS module (many modules default to 9600; change if yours
+/// uses 38400 or another rate).
 pub const UART0_BAUD_RATE: u32 = 9600;
+
+/// Byte ring from UART0 ISR to main (NMEA bursts are short at 9600 baud).
+pub const UART0_RX_RING_CAP: usize = 512;
+
+/// Max NMEA sentence length (incl. `$` … `\r\n`) with margin.
+pub const NMEA_LINE_CAP: usize = 96;
+
+/// Bounded application event queue depth.
+pub const APP_EVENT_QUEUE_CAP: usize = 16;
 
 ////////////////////////////////////////////////////////////////////////////////
 // SOFTWARE TIMERS

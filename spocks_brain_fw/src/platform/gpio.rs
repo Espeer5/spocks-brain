@@ -1,6 +1,9 @@
 //! GPIO control for Spock's brain
 
-use rp_pico::hal::pac::{IO_BANK0, PADS_BANK0, SIO};
+use rp_pico::hal::pac::{Peripherals, IO_BANK0, PADS_BANK0, SIO, TIMER};
+
+use crate::platform::constants::{LED_BLINK_INITIAL_DELAY_US, LED_BLINK_PERIOD_US};
+use crate::platform::timers::{self, SoftMode, SoftTimerId};
 
 /// Raspberry Pi Pico onboard LED (GP25), SIO output, active high.
 pub const ONBOARD_LED_GPIO: usize = 25;
@@ -11,23 +14,27 @@ pub const ONBOARD_LED_GPIO: usize = 25;
 
 /// Initialize GP0 and GP1 for UART0 (GNSS): GP0 = TX, GP1 = RX.
 /// GNSS TX connects to RP2040 RX (GP1); RP2040 TX (GP0) connects to GNSS RX.
+/// Baud is [`crate::platform::constants::UART0_BAUD_RATE`]
 pub fn init_gpios(io: &mut IO_BANK0, pads: &mut PADS_BANK0) {
-    // Pad settings: no pull, input enable for RX (GP1); TX (GP0) gets direction from UART.
-    // PAC uses PADS_BANK0.gpio(n) and pad fields ie(), pue(), pde(), od().
+    // Pad settings: GP1 (RX) has pull-up for idle-high; GP0 (TX) no pull. PAC:
+    // PADS_BANK0.gpio(n) with ie(), pue(), pde(), od().
     pads.gpio(0).modify(|_, w| {
         w.pue().clear_bit();
         w.pde().clear_bit();
         w.od().clear_bit();
         w.ie().set_bit()
     });
+    // RX must idle high (UART mark). Internal pull-up avoids a floating pin when
+    // the GNSS is disconnected, otherwise noise triggers endless RX IRQs and
+    // USB never gets polled
     pads.gpio(1).modify(|_, w| {
-        w.pue().clear_bit();
+        w.pue().set_bit();
         w.pde().clear_bit();
         w.od().clear_bit();
         w.ie().set_bit()
     });
 
-    // IO function selection: GP0 and GP1 as UART0 (PAC: IO_BANK0.gpio(n).gpio_ctrl()).
+    // IO function selection: GP0 and GP1 as UART0
     io.gpio(0).gpio_ctrl().modify(|_, w| w.funcsel().uart());
     io.gpio(1).gpio_ctrl().modify(|_, w| w.funcsel().uart());
 }
@@ -67,3 +74,20 @@ pub fn toggle_onboard_led(sio: &mut SIO) {
     sio.gpio_out_xor().write(|w| unsafe { w.bits(mask) });
 }
 
+/// Callback for [`schedule_onboard_led_demo`] (soft timer on ALARM0).
+pub fn onboard_led_demo_soft_timer_cb(_id: SoftTimerId) {
+    let mut pac = unsafe { Peripherals::steal() };
+    toggle_onboard_led(&mut pac.SIO);
+}
+
+/// Start the onboard LED blink using the multiplexed soft timer (see `TIMER_IRQ_0`).
+pub fn schedule_onboard_led_demo(timer: &mut TIMER) -> Result<SoftTimerId, ()> {
+    timers::schedule_soft(
+        timer,
+        LED_BLINK_INITIAL_DELAY_US,
+        SoftMode::Periodic {
+            period_us: LED_BLINK_PERIOD_US,
+        },
+        onboard_led_demo_soft_timer_cb,
+    )
+}

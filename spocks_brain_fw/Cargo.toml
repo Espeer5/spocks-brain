@@ -15,7 +15,8 @@ embedded-hal = { version = "1.0.0" }
 
 panic-halt = "0.2"
 
-rp-pico = "0.9"
+# `rp2040-e5` enables the USB device erratum workaround in rp2040-hal (needed on B0/B1 silicon).
+rp-pico = { version = "0.9", features = ["rp2040-e5"] }
 
 heapless = "0.8"
 
