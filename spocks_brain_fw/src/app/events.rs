@@ -10,9 +10,6 @@ use crate::app::gnss_parse;
 use crate::platform::constants::{APP_EVENT_QUEUE_CAP, NMEA_LINE_CAP};
 use crate::platform::uart;
 
-#[cfg(feature = "usb-log")]
-use crate::debug::usb_log::{write_gnss_state, UsbLogger};
-
 /// Application events (extend as new sensors are added).
 #[derive(Debug)]
 pub enum Event {
@@ -46,6 +43,18 @@ pub fn try_pop_event() -> Option<Event> {
     interrupt::free(|cs| EVENT_QUEUE.borrow(cs).borrow_mut().pop_front())
 }
 
+/// Handle one event (parse NMEA into global GNSS state).
+///
+/// USB GNSS dumps are **not** done here: formatting + USB on every line starved the main loop
+/// so the UTC LCD only updated after draining the whole queue (multi‑second jumps).
+pub fn dispatch_event(ev: Event, timelr_now: u32) {
+    match ev {
+        Event::GnssNmeaLineReady(line) => {
+            gnss_parse::process_nmea_line(&line, timelr_now);
+        }
+    }
+}
+
 /// NMEA line state (main thread only).
 pub struct NmeaLineAssembler {
     buf: Vec<u8, NMEA_LINE_CAP>,
@@ -74,26 +83,6 @@ impl NmeaLineAssembler {
                 continue;
             }
             let _ = self.buf.push(b);
-        }
-    }
-}
-
-/// Handle one event (e.g. forward GNSS lines to USB when enabled).
-#[cfg(feature = "usb-log")]
-pub fn dispatch_event(ev: Event, usb: &mut UsbLogger) {
-    match ev {
-        Event::GnssNmeaLineReady(line) => {
-            gnss_parse::process_nmea_line(&line);
-            write_gnss_state(usb);
-        }
-    }
-}
-
-#[cfg(not(feature = "usb-log"))]
-pub fn dispatch_event(ev: Event) {
-    match ev {
-        Event::GnssNmeaLineReady(line) => {
-            gnss_parse::process_nmea_line(&line);
         }
     }
 }

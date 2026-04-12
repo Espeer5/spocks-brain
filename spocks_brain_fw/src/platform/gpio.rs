@@ -1,8 +1,10 @@
 //! GPIO control for Spock's brain
 
-use rp_pico::hal::pac::{Peripherals, IO_BANK0, PADS_BANK0, SIO, TIMER};
+use rp_pico::hal::pac::{IO_BANK0, PADS_BANK0, Peripherals, SIO, TIMER};
 
-use crate::platform::constants::{LED_BLINK_INITIAL_DELAY_US, LED_BLINK_PERIOD_US};
+use crate::platform::constants::{
+    I2C1_SCL_GPIO, I2C1_SDA_GPIO, LED_BLINK_INITIAL_DELAY_US, LED_BLINK_PERIOD_US,
+};
 use crate::platform::timers::{self, SoftMode, SoftTimerId};
 
 /// Raspberry Pi Pico onboard LED (GP25), SIO output, active high.
@@ -37,6 +39,19 @@ pub fn init_gpios(io: &mut IO_BANK0, pads: &mut PADS_BANK0) {
     // IO function selection: GP0 and GP1 as UART0
     io.gpio(0).gpio_ctrl().modify(|_, w| w.funcsel().uart());
     io.gpio(1).gpio_ctrl().modify(|_, w| w.funcsel().uart());
+}
+
+/// GP2 = I2C1 SDA, GP3 = I2C1 SCL: open-drain I2C with internal pull-ups.
+pub fn init_i2c1_pins(io: &mut IO_BANK0, pads: &mut PADS_BANK0) {
+    for &n in &[I2C1_SDA_GPIO, I2C1_SCL_GPIO] {
+        pads.gpio(n).modify(|_, w| {
+            w.pue().set_bit();
+            w.pde().clear_bit();
+            w.od().clear_bit();
+            w.ie().set_bit()
+        });
+        io.gpio(n).gpio_ctrl().modify(|_, w| w.funcsel().i2c());
+    }
 }
 
 /// Configure GP25 as SIO output for the Pico’s built-in LED (active high).

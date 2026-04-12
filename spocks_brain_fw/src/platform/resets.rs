@@ -10,6 +10,7 @@ const IO_BANK0_RESET_MASK: u32 = 1 << 5;
 const PAD_BANK0_RESET_MASK: u32 = 1 << 8;
 const TIMER_RESET_MASK: u32 = 1 << 21;
 const UART0_RESET_MASK: u32 = 1 << 22;
+const I2C1_RESET_MASK: u32 = 1 << 4;
 const PLL_SYS_RESET_MASK: u32 = 1 << 12;
 const PLL_USB_RESET_MASK: u32 = 1 << 13;
 
@@ -56,6 +57,11 @@ pub fn clear_timer_reset(resets: &mut RESETS) {
 /// otherwise `reset_done` for UART may not assert.
 pub fn clear_uart0_reset(resets: &mut RESETS) {
     clear_reset_blocking(resets, UART0_RESET_MASK)
+}
+
+/// Release **I2C1** from reset. Call after `clk_sys` / `clk_peri` are running.
+pub fn clear_i2c1_reset(resets: &mut RESETS) {
+    clear_reset_blocking(resets, I2C1_RESET_MASK)
 }
 
 /// Clear timer and UART0 resets

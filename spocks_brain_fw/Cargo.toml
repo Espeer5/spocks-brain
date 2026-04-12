@@ -5,6 +5,8 @@ version = "0.1.0"
 license = "MIT"
 
 [features]
+# USB logging spins the main loop hard when the host does not drain CDC (see `debug::usb_log`).
+# Leave off by default so GNSS + LCD stay responsive; use `--features usb-log` when debugging.
 default = []
 usb-log = ["usb-device", "usbd-serial"]
 
@@ -15,14 +17,19 @@ embedded-hal = { version = "1.0.0" }
 
 panic-halt = "0.2"
 
-# `rp2040-e5` enables the USB device erratum workaround in rp2040-hal (needed on B0/B1 silicon).
+# `rp2040-e5` enables the USB device erratum workaround in rp2040-hal
+# (needed on B0/B1 silicon).
 rp-pico = { version = "0.9", features = ["rp2040-e5"] }
 
 heapless = "0.8"
 
+chrono = { version = "0.4", default-features = false }
+
+nmea = { version = "0.7.0", default-features = false, features = ["GGA", "GLL",
+    "GSA", "GSV", "RMC", "VTG"] }
+
 usb-device = { version = "0.3", optional = true }
 usbd-serial = { version = "0.2", optional = true }
-nmea = { version = "0.7.0", default-features = false, features = ["GGA", "GLL", "GSA", "GSV", "RMC", "VTG"] }
 
 # cargo build/run
 [profile.dev]

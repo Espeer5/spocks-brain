@@ -30,6 +30,8 @@ mod imp {
     /// Static allocator for the USB bus
     static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 
+    static mut USB_LOGGER_POLL: *mut UsbLogger = core::ptr::null_mut();
+
     impl UsbLogger {
         /// Initialize the USB CDC device and logging
         ///
@@ -82,6 +84,23 @@ mod imp {
             Self { usb_dev, serial }
         }
 
+        /// # Safety
+        /// `p` must point to this logger until replaced; only the main thread may
+        /// move/drop the [`UsbLogger`]. Single-core: ISR + main both call [`poll`](Self::poll).
+        pub unsafe fn register_ptr_for_isr(p: *mut UsbLogger) {
+            USB_LOGGER_POLL = p;
+        }
+
+        /// Called from `USBCTRL_IRQ` so enumeration works even if the main loop is busy.
+        pub fn poll_from_isr() {
+            unsafe {
+                if USB_LOGGER_POLL.is_null() {
+                    return;
+                }
+                (*USB_LOGGER_POLL).poll();
+            }
+        }
+
         /// Polling of the logging USB device
         ///
         /// Must be called in main loop of running firwmware when logs enabled
@@ -102,8 +121,9 @@ mod imp {
             let mut off = 0usize;
             let mut spins = 0usize;
             // CDC needs `usb_dev.poll()` between attempts; `WouldBlock` is normal until the host
-            // picks up IN tokens. Abort after a bound so a disconnected cable cannot spin forever.
-            const MAX_SPINS: usize = 500_000;
+            // picks up IN tokens. Keep this **small**: hundreds of thousands of spins here blocked
+            // the main loop for seconds and made the LCD clock crawl (default feature was usb-log).
+            const MAX_SPINS: usize = 4_096;
 
             while off < bytes.len() && spins < MAX_SPINS {
                 self.poll();
@@ -127,52 +147,28 @@ mod imp {
         log.write(s.as_bytes());
     }
 
-    /// Emit a compact text snapshot of the global GNSS state (from `nmea::Nmea`).
+    /// Emit a **small** GNSS snapshot over USB. Keep this cheap: [`UsbLogger::write`] can spin
+    /// up to [`MAX_SPINS`](UsbLogger::write) per call — large dumps + satellite loops blocked the
+    /// main loop and made the LCD UTC line update in multi‑second jumps.
     pub fn write_gnss_state(log: &mut UsbLogger) {
         use core::fmt::Write;
 
         use heapless::String;
 
-        crate::app::gnss_state::with_store(|nmea, stats| {
-            let mut buf = String::<768>::new();
-            let _ = writeln!(&mut buf, "--- GNSS ---");
+        crate::app::gnss_state::with_store(|nmea, stats, _utc_tl, _utc_anchor_dt| {
+            let mut buf = String::<256>::new();
             let _ = writeln!(
                 &mut buf,
-                "stats: applied:{} errors:{}",
-                stats.sentences_applied, stats.parse_errors
-            );
-            let _ = writeln!(
-                &mut buf,
-                "time:{:?} date:{:?} fix:{:?}",
+                "GNSS ok:{} err:{} t:{:?} d:{:?} fix:{:?} lat:{:?} lon:{:?} sats:{:?}",
+                stats.sentences_applied,
+                stats.parse_errors,
                 nmea.fix_timestamp(),
                 nmea.fix_date,
-                nmea.fix_type()
-            );
-            let _ = writeln!(
-                &mut buf,
-                "lat:{:?} lon:{:?} alt_msl_m:{:?} geoid_sep_m:{:?}",
+                nmea.fix_type(),
                 nmea.latitude(),
                 nmea.longitude(),
-                nmea.altitude(),
-                nmea.geoid_separation
-            );
-            let _ = writeln!(
-                &mut buf,
-                "sats_used:{:?} hdop:{:?} pdop:{:?} vdop:{:?}",
                 nmea.fix_satellites(),
-                nmea.hdop(),
-                nmea.pdop,
-                nmea.vdop
             );
-            let _ = writeln!(
-                &mut buf,
-                "sog_kn:{:?} cog_true_deg:{:?}",
-                nmea.speed_over_ground, nmea.true_course
-            );
-            let _ = writeln!(&mut buf, "satellites ({}):", nmea.satellites().len());
-            for sat in nmea.satellites().iter().take(24) {
-                let _ = writeln!(&mut buf, "  {}", sat);
-            }
             log.write(buf.as_bytes());
             log.write(b"\r\n");
         });
