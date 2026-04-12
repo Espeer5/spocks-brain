@@ -22,6 +22,7 @@ heapless = "0.8"
 
 usb-device = { version = "0.3", optional = true }
 usbd-serial = { version = "0.2", optional = true }
+nmea = { version = "0.7.0", default-features = false, features = ["GGA", "GLL", "GSA", "GSV", "RMC", "VTG"] }
 
 # cargo build/run
 [profile.dev]

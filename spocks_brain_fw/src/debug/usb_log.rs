@@ -126,6 +126,57 @@ mod imp {
     pub fn write_str(log: &mut UsbLogger, s: &str) {
         log.write(s.as_bytes());
     }
+
+    /// Emit a compact text snapshot of the global GNSS state (from `nmea::Nmea`).
+    pub fn write_gnss_state(log: &mut UsbLogger) {
+        use core::fmt::Write;
+
+        use heapless::String;
+
+        crate::app::gnss_state::with_store(|nmea, stats| {
+            let mut buf = String::<768>::new();
+            let _ = writeln!(&mut buf, "--- GNSS ---");
+            let _ = writeln!(
+                &mut buf,
+                "stats: applied:{} errors:{}",
+                stats.sentences_applied, stats.parse_errors
+            );
+            let _ = writeln!(
+                &mut buf,
+                "time:{:?} date:{:?} fix:{:?}",
+                nmea.fix_timestamp(),
+                nmea.fix_date,
+                nmea.fix_type()
+            );
+            let _ = writeln!(
+                &mut buf,
+                "lat:{:?} lon:{:?} alt_msl_m:{:?} geoid_sep_m:{:?}",
+                nmea.latitude(),
+                nmea.longitude(),
+                nmea.altitude(),
+                nmea.geoid_separation
+            );
+            let _ = writeln!(
+                &mut buf,
+                "sats_used:{:?} hdop:{:?} pdop:{:?} vdop:{:?}",
+                nmea.fix_satellites(),
+                nmea.hdop(),
+                nmea.pdop,
+                nmea.vdop
+            );
+            let _ = writeln!(
+                &mut buf,
+                "sog_kn:{:?} cog_true_deg:{:?}",
+                nmea.speed_over_ground, nmea.true_course
+            );
+            let _ = writeln!(&mut buf, "satellites ({}):", nmea.satellites().len());
+            for sat in nmea.satellites().iter().take(24) {
+                let _ = writeln!(&mut buf, "  {}", sat);
+            }
+            log.write(buf.as_bytes());
+            log.write(b"\r\n");
+        });
+    }
 }
 
 #[cfg(feature = "usb-log")]

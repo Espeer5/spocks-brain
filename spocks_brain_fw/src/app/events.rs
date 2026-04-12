@@ -6,11 +6,12 @@ use core::mem;
 use cortex_m::interrupt::{self, Mutex};
 use heapless::{Deque, Vec};
 
+use crate::app::gnss_parse;
 use crate::platform::constants::{APP_EVENT_QUEUE_CAP, NMEA_LINE_CAP};
 use crate::platform::uart;
 
 #[cfg(feature = "usb-log")]
-use crate::debug::usb_log::UsbLogger;
+use crate::debug::usb_log::{write_gnss_state, UsbLogger};
 
 /// Application events (extend as new sensors are added).
 #[derive(Debug)]
@@ -82,8 +83,8 @@ impl NmeaLineAssembler {
 pub fn dispatch_event(ev: Event, usb: &mut UsbLogger) {
     match ev {
         Event::GnssNmeaLineReady(line) => {
-            usb.write(&line);
-            usb.write(b"\r\n");
+            gnss_parse::process_nmea_line(&line);
+            write_gnss_state(usb);
         }
     }
 }
@@ -91,6 +92,8 @@ pub fn dispatch_event(ev: Event, usb: &mut UsbLogger) {
 #[cfg(not(feature = "usb-log"))]
 pub fn dispatch_event(ev: Event) {
     match ev {
-        Event::GnssNmeaLineReady(_) => {}
+        Event::GnssNmeaLineReady(line) => {
+            gnss_parse::process_nmea_line(&line);
+        }
     }
 }
